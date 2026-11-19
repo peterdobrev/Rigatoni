@@ -1,51 +1,88 @@
 const { app, BrowserWindow, Tray, Menu, ipcMain, screen, powerMonitor, nativeImage } = require("electron");
 const path = require("path");
 const fs = require("fs");
+const { pathToFileURL } = require("url");
 
 if (!app.requestSingleInstanceLock()) { app.quit(); return; }
 app.setAppUserModelId("com.toni.rigatoni");
 
 const CARD_WIDTH = 480;
 const SNOOZE_MIN = 5;
+const INTERVALS = [1, 20, 30, 45, 60];
+const EXERCISE_IDS = ["chin", "neck", "walk", "thoracic"];
 const asset = name => path.join(__dirname, "assets", name);
 
 // ---------- settings ----------
 const settingsFile = path.join(app.getPath("userData"), "settings.json");
 const today = () => new Date().toDateString();
 let cfg = { interval: 20, sound: true, index: 0, stats: { day: today(), total: 0, by: {} } };
-try { cfg = { ...cfg, ...JSON.parse(fs.readFileSync(settingsFile, "utf8")) }; } catch {}
+try {
+  const saved = JSON.parse(fs.readFileSync(settingsFile, "utf8"));
+  if (saved && typeof saved === "object") {
+    if (INTERVALS.includes(saved.interval)) cfg.interval = saved.interval;
+    if (typeof saved.sound === "boolean") cfg.sound = saved.sound;
+    if (Number.isSafeInteger(saved.index) && saved.index >= 0) cfg.index = saved.index % EXERCISE_IDS.length;
+    if (saved.stats?.day === today()) {
+      if (Number.isSafeInteger(saved.stats.total) && saved.stats.total >= 0) cfg.stats.total = saved.stats.total;
+      for (const id of EXERCISE_IDS) {
+        const count = saved.stats.by?.[id];
+        if (Number.isSafeInteger(count) && count >= 0) cfg.stats.by[id] = count;
+      }
+    }
+  }
+} catch {}
 const save = () => { try { fs.writeFileSync(settingsFile, JSON.stringify(cfg, null, 2)); } catch {} };
 function rollDay() {
-  if (cfg.stats.day !== today()) { cfg.stats = { day: today(), total: 0, by: {} }; save(); }
+  if (cfg.stats.day === today()) return false;
+  cfg.stats = { day: today(), total: 0, by: {} }; save();
+  return true;
 }
 
-const run = { nextAt: 0, paused: false, pausedLeft: 0, cardUp: false, quitting: false };
-const schedule = (mins = cfg.interval) => { run.nextAt = Date.now() + mins * 60000; broadcast(); };
+const run = { nextAt: 0, paused: false, pausedLeft: 0, cardUp: false, completed: false, cardReady: false, pendingReminder: false, quitting: false };
+function schedule(mins = cfg.interval) {
+  run.nextAt = run.paused ? 0 : Date.now() + mins * 60000;
+  run.pausedLeft = run.paused ? mins * 60000 : 0;
+  broadcast();
+}
 
 // ---------- start with Windows ----------
 function loginOptions() {
+  if (process.platform === "darwin") return {};
   // in dev, electron.exe needs the app folder as its first argument
   return app.isPackaged
     ? { path: process.execPath, args: ["--hidden"] }
     : { path: process.execPath, args: [path.resolve(__dirname), "--hidden"] };
 }
-const openAtLogin = () => app.getLoginItemSettings(loginOptions()).openAtLogin;
-const setOpenAtLogin = on => app.setLoginItemSettings({ openAtLogin: on, ...loginOptions() });
+const loginSupported = process.platform !== "darwin" || app.isPackaged;
+const openAtLogin = () => loginSupported && app.getLoginItemSettings(loginOptions()).openAtLogin;
+const setOpenAtLogin = on => {
+  if (loginSupported) app.setLoginItemSettings({ openAtLogin: on, ...loginOptions() });
+};
 
 // ---------- windows ----------
 let mainWin = null, cardWin = null, tray = null;
-const prefs = { preload: path.join(__dirname, "preload.js"), backgroundThrottling: false, autoplayPolicy: "no-user-gesture-required" };
+const prefs = {
+  preload: path.join(__dirname, "preload.js"), contextIsolation: true, sandbox: true,
+  nodeIntegration: false, backgroundThrottling: true, autoplayPolicy: "no-user-gesture-required",
+};
+
+function protectNavigation(win) {
+  win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  win.webContents.on("will-navigate", event => event.preventDefault());
+  win.webContents.on("will-attach-webview", event => event.preventDefault());
+}
 
 function createMain(show) {
   mainWin = new BrowserWindow({
     width: 440, height: 740, minWidth: 380, minHeight: 600, show: false,
-    title: "Toni the Rigatoni", icon: asset("toni.ico"), backgroundColor: "#ecebe8",
+    title: "Toni the Rigatoni", icon: asset(process.platform === "darwin" ? "toni-mac.png" : "toni.ico"), backgroundColor: "#ecebe8",
     autoHideMenuBar: true, webPreferences: prefs,
   });
-  mainWin.loadFile(path.join(__dirname, "src", "app.html"));
+  protectNavigation(mainWin);
   mainWin.on("close", e => { if (!run.quitting) { e.preventDefault(); mainWin.hide(); } });
   sleepWhenHidden(mainWin, true);
   if (show) mainWin.once("ready-to-show", () => mainWin.show());
+  mainWin.loadFile(path.join(__dirname, "src", "app.html"));
 }
 
 function createCard() {
@@ -57,17 +94,20 @@ function createCard() {
   });
   // "screen-saver" keeps the card above normal windows and most full-screen apps
   cardWin.setAlwaysOnTop(true, "screen-saver");
+  protectNavigation(cardWin);
   sleepWhenHidden(cardWin);
+  cardWin.webContents.on("did-finish-load", () => {
+    run.cardReady = true;
+    if (run.pendingReminder) { run.pendingReminder = false; remind(); }
+  });
   cardWin.loadFile(path.join(__dirname, "src", "card.html"));
 }
 
-// Windows keep animating (and burning GPU) unless told to stop, so rest
-// whenever nobody can be looking: hidden, minimized, or (main window) not in front.
 function sleepWhenHidden(win, needFocus) {
   const update = () => {
     if (win.isDestroyed()) return;
     const awake = win.isVisible() && !win.isMinimized() && (!needFocus || win.isFocused());
-    win.webContents.executeJavaScript(`document.documentElement.classList.toggle("asleep", ${!awake})`).catch(() => {});
+    win.webContents.send("visibility", awake);
   };
   win.webContents.on("did-finish-load", update);
   for (const ev of ["show", "hide", "minimize", "restore", "focus", "blur"]) win.on(ev, update);
@@ -75,6 +115,7 @@ function sleepWhenHidden(win, needFocus) {
 
 function showMain() {
   if (!mainWin) createMain(true);
+  if (mainWin.isMinimized()) mainWin.restore();
   mainWin.show(); mainWin.focus();
 }
 
@@ -86,18 +127,19 @@ function placeCard(height) {
 
 function remind() {
   if (run.cardUp) return;
+  if (!run.cardReady) { run.pendingReminder = true; return; }
   rollDay();
-  run.cardUp = true; run.nextAt = 0;
+  run.cardUp = true; run.completed = false; run.nextAt = 0;
   placeCard(cardWin.getBounds().height);
   cardWin.showInactive();
   cardWin.setAlwaysOnTop(true, "screen-saver");
   cardWin.webContents.send("card:show", { index: cfg.index, sound: cfg.sound, stats: cfg.stats });
-  cfg.index++; save(); broadcast();
+  cfg.index = (cfg.index + 1) % EXERCISE_IDS.length; save(); broadcast();
 }
 
 // ---------- state for the main window and tray ----------
 function state() {
-  return { interval: cfg.interval, sound: cfg.sound, stats: cfg.stats, paused: run.paused, pausedLeft: run.pausedLeft, nextAt: run.nextAt, openAtLogin: openAtLogin() };
+  return { interval: cfg.interval, sound: cfg.sound, stats: cfg.stats, paused: run.paused, pausedLeft: run.pausedLeft, nextAt: run.nextAt, openAtLogin: openAtLogin(), loginSupported, platform: process.platform };
 }
 function broadcast() {
   if (mainWin && !mainWin.isDestroyed()) mainWin.webContents.send("state", state());
@@ -123,7 +165,7 @@ function refreshTray() {
       label: `Every ${m} minutes`, type: "radio", checked: cfg.interval === m, click: () => setSettings({ interval: m }),
     })) },
     { label: "Sound", type: "checkbox", checked: cfg.sound, click: () => setSettings({ sound: !cfg.sound }) },
-    { label: process.platform === "darwin" ? "Start at login" : "Start with Windows", type: "checkbox", checked: openAtLogin(), click: () => setSettings({ openAtLogin: !openAtLogin() }) },
+    { label: process.platform === "darwin" ? "Start at login" : "Start with Windows", type: "checkbox", checked: openAtLogin(), enabled: loginSupported, click: () => setSettings({ openAtLogin: !openAtLogin() }) },
     { type: "separator" },
     { label: "Open Toni", click: showMain },
     { label: "Quit", click: () => { run.quitting = true; app.quit(); } },
@@ -131,30 +173,64 @@ function refreshTray() {
 }
 
 function setSettings(s) {
-  if ("interval" in s) { cfg.interval = s.interval; if (!run.cardUp) { run.paused = false; schedule(); } }
-  if ("sound" in s) cfg.sound = s.sound;
-  if ("openAtLogin" in s) setOpenAtLogin(s.openAtLogin);
-  if ("paused" in s) {
-    if (s.paused && !run.paused && run.nextAt) { run.paused = true; run.pausedLeft = run.nextAt - Date.now(); }
-    else if (!s.paused && run.paused) { run.paused = false; run.nextAt = Date.now() + run.pausedLeft; }
+  if (!s || typeof s !== "object" || Array.isArray(s)) return;
+  if (INTERVALS.includes(s.interval)) {
+    cfg.interval = s.interval;
+    if (!run.cardUp || run.paused) schedule();
+  }
+  if (typeof s.sound === "boolean") cfg.sound = s.sound;
+  if (typeof s.openAtLogin === "boolean") setOpenAtLogin(s.openAtLogin);
+  if (typeof s.paused === "boolean") {
+    if (s.paused && !run.paused) {
+      run.pausedLeft = run.nextAt ? Math.max(0, run.nextAt - Date.now()) : cfg.interval * 60000;
+      run.paused = true; run.nextAt = 0;
+    } else if (!s.paused && run.paused) {
+      run.paused = false;
+      run.nextAt = run.cardUp ? 0 : Date.now() + run.pausedLeft;
+      run.pausedLeft = 0;
+    }
   }
   save(); broadcast();
 }
 
 // ---------- IPC ----------
-ipcMain.handle("state:get", () => state());
-ipcMain.on("set", (_e, s) => setSettings(s));
-ipcMain.on("remind:now", remind);
-ipcMain.on("card:resize", (_e, h) => { if (cardWin) { const b = cardWin.getBounds(); cardWin.setBounds({ ...b, height: Math.round(h) }); } });
-ipcMain.handle("card:done", (_e, id) => {
+function fromWindow(event, win, file) {
+  return win && !win.isDestroyed() && event.sender === win.webContents &&
+    event.senderFrame === win.webContents.mainFrame &&
+    event.senderFrame.url === pathToFileURL(path.join(__dirname, "src", file)).href;
+}
+
+ipcMain.handle("state:get", event => {
+  if (!fromWindow(event, mainWin, "app.html")) throw new Error("Untrusted sender");
+  return state();
+});
+ipcMain.on("set", (event, settings) => {
+  if (fromWindow(event, mainWin, "app.html")) setSettings(settings);
+});
+ipcMain.on("remind:now", event => {
+  if (fromWindow(event, mainWin, "app.html")) remind();
+});
+ipcMain.on("card:resize", (event, height) => {
+  if (!fromWindow(event, cardWin, "card.html") || !Number.isFinite(height)) return;
+  const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+  const boundedHeight = Math.min(display.workArea.height, Math.max(100, Math.round(height)));
+  if (cardWin.getBounds().height !== boundedHeight) cardWin.setBounds({ ...cardWin.getBounds(), height: boundedHeight });
+});
+ipcMain.handle("card:done", (event, id) => {
+  if (!fromWindow(event, cardWin, "card.html")) throw new Error("Untrusted sender");
   rollDay();
+  if (!run.cardUp || run.completed || !EXERCISE_IDS.includes(id)) return cfg.stats;
+  run.completed = true;
   cfg.stats.total++;
   cfg.stats.by[id] = (cfg.stats.by[id] || 0) + 1;
   save(); schedule();
   return cfg.stats;
 });
-ipcMain.on("card:snooze", () => schedule(SNOOZE_MIN));
-ipcMain.on("card:hidden", () => {
+ipcMain.on("card:snooze", event => {
+  if (fromWindow(event, cardWin, "card.html") && run.cardUp) schedule(SNOOZE_MIN);
+});
+ipcMain.on("card:hidden", event => {
+  if (!fromWindow(event, cardWin, "card.html") || !run.cardUp) return;
   cardWin.hide(); run.cardUp = false;
   if (!run.nextAt && !run.paused) schedule();
 });
@@ -162,21 +238,23 @@ ipcMain.on("card:hidden", () => {
 // ---------- app ----------
 // "Toni.exe --remind-now" pops the card right away, even if Toni is already running
 app.on("second-instance", (_e, argv) => argv.includes("--remind-now") ? remind() : showMain());
-app.on("activate", showMain); // clicking the Dock icon
+app.on("activate", showMain);
 app.on("before-quit", () => { run.quitting = true; });
-app.on("window-all-closed", e => e.preventDefault());
+app.on("window-all-closed", () => {});
 
 app.whenReady().then(() => {
+  if (process.platform === "darwin") app.dock?.setIcon(asset("toni-mac.png"));
   createCard();
-  createMain(!process.argv.includes("--hidden"));
+  const openedAtLogin = process.platform === "darwin" && app.getLoginItemSettings().wasOpenedAtLogin;
+  createMain(!process.argv.includes("--hidden") && !openedAtLogin);
 
   tray = new Tray(nativeImage.createFromPath(asset(process.platform === "darwin" ? "tray-mac.png" : "tray.png")));
   tray.on("click", showMain);
 
   schedule();
-  if (process.argv.includes("--remind-now")) cardWin.webContents.once("did-finish-load", () => setTimeout(remind, 500));
+  if (process.argv.includes("--remind-now")) remind();
   setInterval(() => {
-    rollDay();
+    if (rollDay()) broadcast();
     if (!run.paused && !run.cardUp && run.nextAt && Date.now() >= run.nextAt) remind();
   }, 1000);
   setInterval(refreshTray, 30000);

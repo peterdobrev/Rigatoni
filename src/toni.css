@@ -76,5 +76,4 @@
 
 @media (prefers-reduced-motion: reduce) { .toni * { animation: none !important; transition: none !important; } }
 
-/* paused while the window is hidden, so Toni uses no CPU in the background */
 html.asleep *, html.asleep *::before, html.asleep *::after { animation-play-state: paused !important; }

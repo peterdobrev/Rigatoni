@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
 <title>Toni the Rigatoni</title>
 <link rel="stylesheet" href="toni.css">
 <style>
@@ -55,59 +56,12 @@
     </select>
     <button id="sound">Sound: on</button>
   </div>
-  <label class="check"><input type="checkbox" id="login"> Start Toni when Windows starts</label>
+  <label class="check"><input type="checkbox" id="login"> <span id="login-label">Start Toni at login</span></label>
   <div class="stats" id="stats"></div>
   <div class="hint">Closing this window keeps Toni running in the tray.</div>
 </div>
 
 <script src="toni.js"></script>
-<script>
-const $ = id => document.getElementById(id);
-const hero = makeToni(); $("hero").appendChild(hero);
-let state = null;
-
-function showPose(p) {
-  setPose(hero, p);
-  $("pose-pill").textContent = POSES.find(x => x[0] === p)[1];
-  [...$("poses").children].forEach(b => b.setAttribute("aria-pressed", b.dataset.p === p));
-}
-POSES.forEach(([p, label]) => {
-  const b = document.createElement("button");
-  b.textContent = label; b.dataset.p = p; b.onclick = () => showPose(p);
-  $("poses").appendChild(b);
-});
-showPose("wave");
-setTimeout(() => showPose("idle"), 2600);
-
-const fmtClock = ms => { const s = Math.max(0, Math.ceil(ms / 1000)); return String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0"); };
-
-function render() {
-  if (!state) return;
-  $("interval").value = String(state.interval);
-  $("sound").textContent = "Sound: " + (state.sound ? "on" : "off");
-  $("pause").textContent = state.paused ? "Resume" : "Pause";
-  $("login").checked = state.openAtLogin;
-  const n = state.stats.total;
-  $("stats").textContent = n ? `${n} stretch${n === 1 ? "" : "es"} today` : "No stretches yet today.";
-  tick();
-}
-
-function tick() {
-  if (!state) return;
-  if (state.paused) { $("clock-label").textContent = "Paused"; $("clock").textContent = fmtClock(state.pausedLeft); return; }
-  $("clock-label").textContent = "Next stretch in";
-  $("clock").textContent = state.nextAt ? fmtClock(state.nextAt - Date.now()) : "now";
-}
-
-toni.on("state", s => { state = s; render(); });
-toni.invoke("state:get").then(s => { state = s; render(); });
-setInterval(tick, 1000);
-
-$("now").onclick = () => toni.send("remind:now");
-$("pause").onclick = () => toni.send("set", { paused: !state.paused });
-$("interval").onchange = e => toni.send("set", { interval: Number(e.target.value) });
-$("sound").onclick = () => toni.send("set", { sound: !state.sound });
-$("login").onchange = e => toni.send("set", { openAtLogin: e.target.checked });
-</script>
+<script src="app.js"></script>
 </body>
 </html>
